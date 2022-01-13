@@ -1,22 +1,28 @@
 from rapidfuzz import fuzz
 from rapidfuzz.string_metric import jaro_similarity, jaro_winkler_similarity
 import pandas as pd
+import numpy as np
 import re
 import os
 import glob
 from pyarrow import fs
 import pyarrow.parquet as pq
 from sklearn.neighbors import BallTree
-import numpy as np
+from enum import Enum
 
+
+class DistanceMethod(Enum):
+    LEVENSHTEIN = 1
+    JARO = 2
+    JARO_WINKLER = 3    
 
 class GeoMatcher:
 
-    __slot__ = (
+    __slots__ = (
         "_hierarchy",
         "_file_location",
         "_index_data",
-        "_filename",
+        "_filenames",
         "_street_code_dict",
     )
 
@@ -24,36 +30,33 @@ class GeoMatcher:
         self._hierarchy = hierarchy
 
         # if no file location provided, look for the dataset in the default folder: data/[country]
-        if file_location.strip() == "":
+        if not file_location.strip():
             if os.path.isdir(os.path.join("data", self._hierarchy.name)):
                 self._file_location = os.path.join("data", self._hierarchy.name)
             else:
                 raise ValueError(
-                    "Folder names that contain the index file can't be found: "
-                    + os.path.join("data", self._hierarchy.name)
+                    f"Folder names that contain the index file can't be found: "
+                    f"{os.path.join('data', self._hierarchy.name)}"
                 )
         else:
             if os.path.isdir(file_location):
                 self._file_location = file_location
             else:
                 raise ValueError(
-                    "Folder names that contain the index file can't be found: "
-                    + file_location
+                    f"Folder names that contain the index file can't be found: "
+                    f"{file_location}"
                 )
 
         # get all the parquet filenames within the folder
-        self._filename = glob.glob(os.path.join(self._file_location, "*.parquet"))
+        self._filenames = glob.glob(os.path.join(self._file_location, "*.parquet"))
 
         # init
         index_file = "index.parquet"
 
         # check if the index file exists
-        if os.path.join(self._file_location, index_file) not in self._filename:
+        if os.path.join(self._file_location, index_file) not in self._filenames:
             raise ValueError(
-                "Index file ("
-                + index_file
-                + ") can't be found in: "
-                + self._file_location
+                f"Index file ({index_file}) can't be found in: {self._file_location}"
             )
 
         # read the index file
@@ -65,28 +68,27 @@ class GeoMatcher:
         idx_columns = ["IDX", "ADDRESS", "FILE_NAME"]
         if not set(idx_columns).issubset(self._index_data.columns):
             raise ValueError(
-                "The required columns can't be found in the index file: "
-                + str(set(idx_columns) - set(self._index_data.columns))
+                f"The required columns can't be found in the index file: "
+                f"{str(set(idx_columns) - set(self._index_data.columns))}"
             )
 
         # remove index file from the lists
-        self._filename.remove(os.path.join(self._file_location, index_file))
+        self._filenames.remove(os.path.join(self._file_location, index_file))
 
         # check parquet file schema (ensure all of the required columns are exist)
         # get the regions that users selected
         all_regions = self._hierarchy.get_regions_by_name(attribute="col_name")
         all_columns = list(filter(None, all_regions))
 
-        for file in self._filename:
+        for file in self._filenames:
             pq_columns = pq.read_schema(file).names
             if not set(all_columns).issubset(pq_columns):
                 raise ValueError(
-                    "The required columns "
-                    + str(set(all_columns) - set(pq_columns))
-                    + " can't be found in the parquet file: "
-                    + file
+                    f"The required columns {str(set(all_columns) - set(pq_columns))}"
+                    f" can't be found in the parquet file: {file}"
                 )
 
+        # define the dictionary for street code normalization
         self._street_code_dict = {
             "ALLY": "ALLEY",
             "ALY": "ALLEY",
@@ -127,9 +129,17 @@ class GeoMatcher:
 
     def _remove_street_number(self, address):
         """
-        remove the street number, lot/unit/level number from the address
-
-        :param string address:
+        Remove the street number, lot/unit/level number, or similar attributes
+        from the address
+        
+        Parameter
+        ---------
+        address: string
+            The physical address' text
+        
+        Return
+        ------
+            An address without the street number
         """
 
         # initiate the result
@@ -161,9 +171,19 @@ class GeoMatcher:
 
     def _cleaning_match_with_index(self, no_number_address):
         """
-
-
-        :param string no_number_address:
+        Return similar addresses of the no_number_address with
+        the index file based on postcode and state or
+        locality/suburb or street name.
+        
+        Parameter
+        ---------
+        no_number_address: string
+            The physical address without the street number,
+            lot/unit/level number, or similar attribute
+        
+        Returns
+        -------
+            A matched address
         """
 
         # initiate the dataframe
@@ -240,9 +260,19 @@ class GeoMatcher:
 
     def _cleaning_address(self, no_number_address):
         """
-
-
-        :param string no_number_address:
+        Return the clean address.
+        The function will revise the locality/suburb or other attributes
+        if necessary.
+        
+        Parameter
+        ---------
+        no_number_address: string
+            The physical address without the street number,
+            lot/unit/level number, or similar attribute
+        
+        Return
+        ------
+            A clean address
         """
 
         matched_df = self._cleaning_match_with_index(no_number_address)
@@ -329,12 +359,11 @@ class GeoMatcher:
         self,
         address,
         similarity_threshold=0.9,
-        top_result=True,
-        regions=[],
+        nlargest=1,
+        regions=None,
         operator=None,
-        region="",
         address_cleaning=False,
-        string_metric="levenshtein",
+        method=DistanceMethod.LEVENSHTEIN,
     ):
         """
         perform address based matching and return the corresponding region
@@ -343,20 +372,74 @@ class GeoMatcher:
         Parameters
         ----------
         address:string
+            The complete physical address
+        similarity_threshold:float
+            The minimum similarity ratio ranges between 0 and 1 (default = 0.9)
+        nlargest:int
+            The number of the addresses to be returned by the function.
+            If nlargest = 1, then the function will return the top similarity only
+            (default = 1)
+        regions:string or list of string
+            Specify the name or list of names of the regions to be returned by the function
+        operator: Operator
+            use the operator (Operator.ge or Operator.le) to find all the 
+            upper/lower level regions from a particular region name.
+            For instance: Country >= State (Country ge State).
+                          Use the 'ge' operator to search for the upper level of State
+                          (and itself)
         address_cleaning:boolean
-            perform data cleaning on the address, for instance: revise invalid suburb name
-            (currently, only applied to Australian addresses)
+            whether to perform data cleansing on the address, 
+            for instance: revise invalid suburb name 
+            (currently, only applied to Australian addresses. Set this parameter 
+            as True for non-Australian addresses could return an error)
+        method:string
+            The name of the edit distance algorithm used.
+            Select one of DistanceMethod.LEVENSHTEIN,DistanceMethod.JARO, 
+            or DistanceMethod.JARO_WINKLER
+        
         Returns
-        ----------
+        -------
+        Dictionary
+            the dictionary of the matched adddresses. The keys of the dictionary 
+            are based on the column name defined in the Hierarchy object used. 
+            By default, the function will return only the top similarity record 
+            (nlargest = 1) as long as its similarity is larger than the threshold 
+            ratio. If no addresses have a similarity ratio more than the 
+            threshold, the function will return an empty dictionary.
+        
+        Examples
+        --------
+        >>> matcher = GeoMatcher(AUS)
+        >>> matched = matcher.get_region_by_address("2885 Darnley Street,
+                      Braybrookt, VIC 3019", similarity_threshold = 0.95)
+        >>> matched
+        {'MB_CODE_2016': ['20375120000'],
+         'SA4_NAME_2016': ['Melbourne - West'],
+         'SA3_NAME_2016': ['Maribyrnong'],
+         'SA2_NAME_2016': ['Braybrook']
+         'SA1_7DIGITCODE_2016': ['2134703'],
+         'STATE': ['VIC'],
+         'RATIO': [0.9841269841269842],
+         'SSC_NAME_2016': ['Braybrook'],
+         'LGA_NAME_2016': ['Maribyrnong (C)'],
+         'FULL_ADDRESS': ['2885 DARNLEY STREET BRAYBROOK VIC 3019']}
         """
 
-        if string_metric not in ["levenshtein", "jaro", "jaro_winkler"]:
+        if not isinstance(method, DistanceMethod):
             raise ValueError(
-                "String metric is unknown. Select one of 'levenshtein','jaro','jaro_winkler'"
+                f"String metric is unknown. Select one of {[e.value for e in DistanceMethod]}"
             )
 
         if similarity_threshold < 0:
             raise ValueError("Similarity threshold has to be larger than 0")
+
+        if nlargest < 1:
+            raise ValueError("The number of returned records must be at least 1")
+            
+        #list of functions
+        dist_functions = {DistanceMethod.LEVENSHTEIN: fuzz.ratio,
+                          DistanceMethod.JARO: jaro_similarity,
+                          DistanceMethod.JARO_WINKLER: jaro_winkler_similarity}
 
         # initiate the result
         addresses = pd.DataFrame()
@@ -380,32 +463,19 @@ class GeoMatcher:
                 # calculate the distance (Levenshtein Distance) between the
                 # input address (without street number) and the index
                 # [all special characters are removed]
-                if string_metric == "levenshtein":
-                    self._index_data["RATIO"] = self._index_data["ADDRESS"].apply(
-                        lambda x: fuzz.ratio(
-                            re.sub(r"[\W_]+", "", clean_address),
-                            re.sub(r"[\W_]+", "", x.upper()),
-                        )
+                
+                self._index_data["RATIO"] = self._index_data["ADDRESS"].apply(
+                    lambda x: dist_functions[method](
+                        re.sub(r"[\W_]+", "", clean_address),
+                        re.sub(r"[\W_]+", "", x.upper()),
                     )
-                elif string_metric == "jaro":
-                    self._index_data["RATIO"] = self._index_data["ADDRESS"].apply(
-                        lambda x: jaro_similarity(
-                            re.sub(r"[\W_]+", "", clean_address),
-                            re.sub(r"[\W_]+", "", x.upper()),
-                        )
-                    )
-                else:
-                    self._index_data["RATIO"] = self._index_data["ADDRESS"].apply(
-                        lambda x: jaro_winkler_similarity(
-                            re.sub(r"[\W_]+", "", clean_address),
-                            re.sub(r"[\W_]+", "", x.upper()),
-                        )
-                    )
+                    / 100.0
+                )
 
                 # get the index with the largest similarity
                 largest_idx = self._index_data.nlargest(1, "RATIO")
 
-                if largest_idx["RATIO"].values[0] < similarity_threshold * 100:
+                if largest_idx["RATIO"].values[0] < similarity_threshold:
                     return {}
 
                 # first, check the filename it it's available
@@ -428,38 +498,25 @@ class GeoMatcher:
                 # input address (with street number) and the entire addresses
                 # reference dataset
                 # [all special characters are removed]
-                if string_metric == "levenshtein":
-                    address_parquet["RATIO"] = address_parquet["FULL_ADDRESS"].apply(
-                        lambda x: fuzz.ratio(
-                            re.sub(r"[\W_]+", "", address.upper()),
-                            re.sub(r"[\W_]+", "", x.upper()),
-                        )
+                
+                address_parquet["RATIO"] = address_parquet["FULL_ADDRESS"].apply(
+                    lambda x: dist_functions[method](
+                        re.sub(r"[\W_]+", "", address.upper()),
+                        re.sub(r"[\W_]+", "", x.upper()),
                     )
-                elif string_metric == "jaro":
-                    address_parquet["RATIO"] = address_parquet["FULL_ADDRESS"].apply(
-                        lambda x: jaro_similarity(
-                            re.sub(r"[\W_]+", "", address.upper()),
-                            re.sub(r"[\W_]+", "", x.upper()),
-                        )
-                    )
-                else:
-                    address_parquet["RATIO"] = address_parquet["FULL_ADDRESS"].apply(
-                        lambda x: jaro_winkler_similarity(
-                            re.sub(r"[\W_]+", "", address.upper()),
-                            re.sub(r"[\W_]+", "", x.upper()),
-                        )
-                    )
+                    / 100.0
+                )
 
                 # if similarity score is larger then the threshold,
                 # there is a possibility the addresses are similar
                 # will need to select the highest score later on
                 addresses = address_parquet[
-                    address_parquet["RATIO"] >= similarity_threshold * 100.0
+                    address_parquet["RATIO"] >= similarity_threshold
                 ]
 
                 # get the regions that users selected
                 selected_regions = self._hierarchy.get_regions_by_name(
-                    operator=operator, name=region, names=regions
+                    region_names = regions, operator=operator
                 )
 
                 # get the columns only
@@ -479,7 +536,7 @@ class GeoMatcher:
                 # if there are possible similar address found
                 if addresses.shape[0] > 0:
                     # return the most similar address only
-                    if top_result:
+                    if nlargest == 1:
 
                         # sort the addresses based on the similarity score
                         addresses = addresses.sort_values(
@@ -495,6 +552,7 @@ class GeoMatcher:
 
                         return (
                             addresses[selected_columns]
+                            .nlargest(nlargest, "RATIO")
                             .sort_values(by="RATIO", ascending=False)
                             .to_dict(orient="list")
                         )
@@ -502,7 +560,7 @@ class GeoMatcher:
                     return {}
 
             else:
-                raise ValueError("The address file can't be found: " + parquet_filename)
+                raise ValueError(f"The address file can't be found: {parquet_filename}")
 
         else:
             raise ValueError(
@@ -510,10 +568,28 @@ class GeoMatcher:
             )
 
     def _load_parquet(self, lat, lon, distance):
+        """
+        load the rows in the parquet file meeting the condition
+        the condition is to ensure the LATITUDE and LONGITUDE are within a distance from the
+        argument lat and lon
+
+        Parameters
+        ----------
+        lat:float
+            latitude
+        lon:float
+            longitude
+        distance:integer
+                define what the minimum km of distance from the argument lat and lon
+        
+        Returns
+        -------
+        a panda dataframe
+        """
 
         local = fs.LocalFileSystem()
         df = pq.read_table(
-            self._filename,
+            self._filenames,
             filesystem=local,
             filters=[
                 ("LATITUDE", ">=", lat - distance),
@@ -526,7 +602,13 @@ class GeoMatcher:
         return df
 
     def get_region_by_coordinates(
-        self, lat, lon, n=1, km=1, regions=[], operator=None, region=""
+        self, 
+        lat, 
+        lon, 
+        n=1, 
+        km=1, 
+        regions=None, 
+        operator=None
     ):
         """
         perform coordinate_based matching and return the corresponding regions in a dictionary
@@ -534,15 +616,40 @@ class GeoMatcher:
 
         Parameters
         ----------
-        latitude:float
-        longitude:float
+        lat:float
+            latitude
+        lon:float
+            longitude
         n:integer
             the number of nearest addresses to be returned by the function.
         km:integer
             the nearest addresses will be searched from the input coordinates
             point within the argument kilometer radius
+        
         Returns
-        ----------
+        -------
+        Dictionary    
+            a dictionary of addresses with statistical and administrative regions.
+            By default, the function will return the record with the smallest
+            distance only (n = 1). If no addresses found within the radius (km), 
+            the function will return an empty dictionary.
+        
+        Examples
+        --------
+        >>> matcher = GeoMatcher(AUS)
+        >>> matched = matcher.get_region_by_address(-26.657299,153.094955)
+        >>> matched
+        {'FULL_ADDRESS': ['8 32 SECOND AVENUE MAROOCHYDORE QLD 4558'],
+         'LATITUDE': [-26.6572865955204],
+         'LONGITUDE': [153.09496396875],
+         'LGA_NAME_2016': ['Sunshine Coast (R)'],
+         'SSC_NAME_2016': ['Maroochydore'],
+         'SA4_NAME_2016': ['Sunshine Coast'],
+         'SA3_NAME_2016': ['Maroochy'],
+         'SA2_NAME_2016': ['Maroochydore - Kuluin'],
+         'SA1_7DIGITCODE_2016': ['3142707'],
+         'MB_CODE_2016': ['30563074700'],
+         'DISTANCE': [0.0016422183328786543]}
         """
 
         min_distance = 0
